@@ -25,7 +25,113 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+
+# ============================================================
+# 0. ONNX pre-processing (opset downgrade + simplify)
+# ============================================================
+MAX_COMPATIBLE_OPSET = 12
+
+
+def preprocess_onnx(onnx_path: str) -> str:
+    """
+    Pre-process an ONNX model for TensorRT 8.x compatibility.
+
+    1) Downgrade opset to 12 (TRT 8.x fails on Gather nodes in opset >=17).
+    2) Try onnxsim to simplify the graph (often resolves Gather/Resize issues).
+    3) Cast INT64 initialisers to INT32 (TRT clamps INT64 with warnings/errors).
+    4) Save to a temp file and return its path.
+
+    If preprocessing is not needed or onnx is not installed, returns the
+    original path unchanged.
+    """
+    try:
+        import onnx
+        from onnx import TensorProto
+    except ImportError:
+        print("[WARN] onnx package not installed; skipping ONNX preprocessing.")
+        print("[WARN] Install with:  pip install onnx onnxsim")
+        return onnx_path
+
+    model = onnx.load(onnx_path)
+    original_opset = getattr(model.opset_import[0], "version", None)
+    needs_fix = False
+
+    if original_opset is not None and original_opset > MAX_COMPATIBLE_OPSET:
+        print(f"[INFO] Opset {original_opset} > {MAX_COMPATIBLE_OPSET}; downgrading for TRT 8.x compatibility.")
+        needs_fix = True
+    else:
+        print(f"[INFO] Opset version: {original_opset}")
+
+    for init in model.graph.initializer:
+        if init.data_type == TensorProto.INT64:
+            needs_fix = True
+            break
+
+    if not needs_fix:
+        try:
+            onnxsim = __import__("onnxsim")
+            print("[INFO] Running onnxsim to simplify model graph...")
+            model, success = onnxsim.simplify(model)
+            if success:
+                print("[INFO] onnxsim simplification succeeded.")
+            else:
+                print("[WARN] onnxsim simplification reported issues; continuing with original.")
+                model = onnx.load(onnx_path)
+        except ImportError:
+            print("[INFO] onnxsim not installed; skipping graph simplification.")
+
+        return onnx_path
+
+    # --- Apply fixes ---
+    # Downgrade opset
+    if original_opset is not None and original_opset > MAX_COMPATIBLE_OPSET:
+        model.opset_import[0].version = MAX_COMPATIBLE_OPSET
+
+    # Cast INT64 initializers to INT32
+    import numpy as np
+    for init in model.graph.initializer:
+        if init.data_type == TensorProto.INT64:
+            arr = onnx.numpy_helper.to_array(init)
+            arr = arr.astype(np.int32)
+            new_init = onnx.numpy_helper.from_array(arr, init.name)
+            init.CopyFrom(new_init)
+
+    # Also fix INT64 constant nodes
+    for node in model.graph.node:
+        if node.op_type == "Constant":
+            for attr in node.attribute:
+                if attr.t.data_type == TensorProto.INT64:
+                    arr = onnx.numpy_helper.to_array(attr.t)
+                    arr = arr.astype(np.int32)
+                    attr.t.CopyFrom(onnx.numpy_helper.from_array(arr))
+
+    # Try onnxsim simplification after fixes
+    try:
+        onnxsim = __import__("onnxsim")
+        print("[INFO] Running onnxsim after opset downgrade + INT64 cast...")
+        model, success = onnxsim.simplify(model)
+        if success:
+            print("[INFO] onnxsim simplification succeeded.")
+        else:
+            print("[WARN] onnxsim reported issues; using fixed-but-unsimplified model.")
+    except ImportError:
+        print("[INFO] onnxsim not installed; skipping simplification after fixes.")
+
+    # Validate before saving
+    try:
+        onnx.checker.check_model(model, full_check=False)
+        print("[INFO] ONNX model validation passed after preprocessing.")
+    except Exception as e:
+        print(f"[WARN] ONNX validation issue (may still work): {e}")
+
+    # Save to temp file next to the original
+    tmp_path = str(Path(onnx_path).with_suffix(".opset12.onnx"))
+    onnx.save(model, tmp_path)
+    print(f"[INFO] Saved preprocessed ONNX: {tmp_path}")
+    return tmp_path
 
 
 # ============================================================
@@ -76,11 +182,14 @@ def convert_onnx_to_engine(
     Tries trtexec first; falls back to TensorRT Python API if trtexec is missing.
     Optimized for Jetson Nano (conservative workspace, FP16).
     """
-    onnx_path = Path(onnx_path)
-    engine_path = Path(engine_path)
+    onnx_path_orig = Path(onnx_path)
+    if not onnx_path_orig.exists():
+        raise FileNotFoundError(f"ONNX file not found: {onnx_path_orig}")
 
-    if not onnx_path.exists():
-        raise FileNotFoundError(f"ONNX file not found: {onnx_path}")
+    # Pre-process ONNX for TRT 8.x compatibility (opset downgrade, INT64→INT32)
+    preprocessed = preprocess_onnx(str(onnx_path_orig))
+    onnx_path = Path(preprocessed)
+    engine_path = Path(engine_path)
 
     if engine_path.exists():
         print(f"[INFO] Engine already exists: {engine_path}")
