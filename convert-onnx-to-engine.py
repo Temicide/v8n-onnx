@@ -1,86 +1,96 @@
 # -*- coding: utf-8 -*-
-"""YOLOv8n CCTV Detection + TensorRT Engine Conversion (Colab T4)"""
+"""Convert ONNX model to TensorRT .engine file on Jetson Nano.
 
+This script is designed to run directly on the Jetson Nano (not Colab).
+TensorRT .engine files are hardware-specific and must be built on the target device.
+
+Examples:
+    # Interactive mode (prompts for ONNX path)
+    python3 convert-onnx-to-engine.py
+
+    # Direct CLI usage -- YOLO detector
+    python3 convert-onnx-to-engine.py \
+        --onnx exports/yolo26n_opset12.onnx \
+        --engine exports/yolo26n_fp16.engine \
+        --imgsz 640
+
+    # Direct CLI usage -- EfficientNet classifier
+    python3 convert-onnx-to-engine.py \
+        --onnx exports/efficientnetb0_brand_opset12.onnx \
+        --engine exports/efficientnetb0_brand_fp16.engine \
+        --imgsz 224
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
-import sys
 import subprocess
-import threading
-import warnings
+import sys
+from pathlib import Path
 
-# ═══════════════════════════════════════════════════════════
-# 1. Dependency Setup (safe for .py and Colab)
-# ═══════════════════════════════════════════════════════════
-def setup_dependencies():
-    """Auto-install missing packages so this works on a fresh Colab T4 runtime."""
-    required = {
-        "cv2": "opencv-python",
-        "numpy": "numpy",
-        "onnxruntime": "onnxruntime-gpu",
-        "tensorrt": "tensorrt",
-        "onnx": "onnx",
-    }
-    missing = []
-    for import_name, pkg_name in required.items():
-        try:
-            __import__(import_name)
-        except ImportError:
-            missing.append(pkg_name)
 
-    if missing:
-        print(f"[INFO] Installing missing packages: {missing}")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + missing)
-        # Re-import after install
-        for import_name in missing:
-            try:
-                __import__(import_name.replace("-", "_").split("==")[0].split(">=")[0])
-            except Exception:
-                pass
-
-setup_dependencies()
-
-import cv2
-import numpy as np
-import onnxruntime as ort
-
-# ═══════════════════════════════════════════════════════════
-# 2. ONNX → TensorRT Engine Conversion
-# ═══════════════════════════════════════════════════════════
+# ============================================================
+# 1. Locate trtexec
+# ============================================================
 def find_trtexec():
-    """Find the trtexec binary in Colab/common paths."""
-    # 1) Check system PATH
-    for cmd in [["which", "trtexec"], ["where", "trtexec"]]:
+    """Find the trtexec binary. Prioritizes Jetson paths, then system PATH."""
+    # 1) Known Jetson / TensorRT install locations
+    candidates = [
+        "/usr/src/tensorrt/bin/trtexec",
+        "/usr/local/bin/trtexec",
+        "/usr/bin/trtexec",
+    ]
+    # 2) JetPack Python wheel paths
+    for py_ver in ("python3.12", "python3.11", "python3.10", "python3.9", "python3.8"):
+        candidates.append(
+            f"/usr/local/lib/{py_ver}/dist-packages/tensorrt_libs/trtexec"
+        )
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+
+    # 3) Check system PATH
+    for cmd in (["which", "trtexec"], ["where", "trtexec"]):
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             if r.returncode == 0 and r.stdout.strip():
                 return r.stdout.strip().splitlines()[0]
         except Exception:
             continue
-
-    # 2) Check known Colab / TensorRT install locations
-    candidates = [
-        "/usr/src/tensorrt/bin/trtexec",
-        "/usr/local/lib/python3.12/dist-packages/tensorrt_libs/trtexec",
-        "/usr/local/lib/python3.11/dist-packages/tensorrt_libs/trtexec",
-        "/usr/local/lib/python3.10/dist-packages/tensorrt_libs/trtexec",
-        "/usr/local/lib/python3.9/dist-packages/tensorrt_libs/trtexec",
-    ]
-    for c in candidates:
-        if os.path.isfile(c) and os.access(c, os.X_OK):
-            return c
     return None
 
 
-def convert_onnx_to_engine(onnx_path, engine_path, fp16=True, workspace_mb=4096):
+# ============================================================
+# 2. ONNX -> TensorRT Engine Conversion
+# ============================================================
+def convert_onnx_to_engine(
+    onnx_path: str,
+    engine_path: str,
+    imgsz: int = 640,
+    fp16: bool = True,
+    workspace_mb: int = 1024,
+    dynamic: bool = False,
+    batch: int = 1,
+) -> str:
     """
     Convert ONNX to TensorRT engine.
     Tries trtexec first; falls back to TensorRT Python API if trtexec is missing.
-    Optimized for Google Colab T4 (FP16, ~4 GB workspace).
+    Optimized for Jetson Nano (conservative workspace, FP16).
     """
-    if os.path.exists(engine_path):
-        print(f"[INFO] Engine already exists: {engine_path}")
-        return engine_path
+    onnx_path = Path(onnx_path)
+    engine_path = Path(engine_path)
 
-    # ── Method 1: trtexec (fastest, most optimized) ──
+    if not onnx_path.exists():
+        raise FileNotFoundError(f"ONNX file not found: {onnx_path}")
+
+    if engine_path.exists():
+        print(f"[INFO] Engine already exists: {engine_path}")
+        return str(engine_path)
+
+    engine_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # -- Method 1: trtexec (fastest, most optimized) --
     trtexec = find_trtexec()
     if trtexec:
         print(f"[INFO] Found trtexec: {trtexec}")
@@ -89,23 +99,32 @@ def convert_onnx_to_engine(onnx_path, engine_path, fp16=True, workspace_mb=4096)
             f"--onnx={onnx_path}",
             f"--saveEngine={engine_path}",
             f"--workspace={workspace_mb}",
+            f"--minShapes=images:{batch}x3x{imgsz}x{imgsz}",
+            f"--optShapes=images:{batch}x3x{imgsz}x{imgsz}",
+            f"--maxShapes=images:{batch}x3x{imgsz}x{imgsz}",
         ]
         if fp16:
             cmd.append("--fp16")
 
         print(f"[INFO] Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        print(result.stdout)
-        if result.returncode == 0 and os.path.exists(engine_path):
+        result = subprocess.run(cmd, capture_output=False, text=True)
+        if result.returncode == 0 and engine_path.exists():
             print(f"[INFO] trtexec conversion successful: {engine_path}")
-            return engine_path
+            return str(engine_path)
         else:
-            print(f"[WARN] trtexec failed, stderr:\n{result.stderr}")
+            print(f"[WARN] trtexec failed (rc={result.returncode}).")
+            if result.stderr:
+                print(f"[WARN] stderr:\n{result.stderr}")
 
-    # ── Method 2: TensorRT Python API (fallback) ──
+    # -- Method 2: TensorRT Python API (fallback) --
     print("[INFO] Falling back to TensorRT Python API...")
-    import tensorrt as trt
-    import onnx
+    try:
+        import tensorrt as trt
+    except ImportError as exc:
+        raise RuntimeError(
+            "TensorRT Python API not available. "
+            "Install TensorRT for JetPack or ensure trtexec is on PATH."
+        ) from exc
 
     logger = trt.Logger(trt.Logger.INFO)
     builder = trt.Builder(logger)
@@ -124,25 +143,37 @@ def convert_onnx_to_engine(onnx_path, engine_path, fp16=True, workspace_mb=4096)
 
     config = builder.create_builder_config()
 
-    # T4 has 16 GB VRAM; 4 GB workspace is safe
+    # Jetson Nano has only 4 GB shared memory; keep workspace modest
     if hasattr(config, "max_workspace_size"):
         config.max_workspace_size = workspace_mb * 1024 * 1024
 
     if fp16:
         config.set_flag(trt.BuilderFlag.FP16)
 
-    # YOLOv8n input: [1, 3, 640, 640]
     input_tensor = network.get_input(0)
     profile = builder.create_optimization_profile()
-    profile.set_shape(
-        input_tensor.name,
-        min=(1, 3, 640, 640),
-        opt=(1, 3, 640, 640),
-        max=(1, 3, 640, 640),
-    )
+
+    if dynamic:
+        # Allow batch size to vary between 1 and user-provided batch
+        max_batch = max(batch, 1)
+        profile.set_shape(
+            input_tensor.name,
+            min=(1, 3, imgsz, imgsz),
+            opt=(1, 3, imgsz, imgsz),
+            max=(max_batch, 3, imgsz, imgsz),
+        )
+    else:
+        profile.set_shape(
+            input_tensor.name,
+            min=(batch, 3, imgsz, imgsz),
+            opt=(batch, 3, imgsz, imgsz),
+            max=(batch, 3, imgsz, imgsz),
+        )
     config.add_optimization_profile(profile)
 
-    print("[INFO] Building engine (may take 2–5 min on T4)...")
+    print(f"[INFO] Building engine (imgsz={imgsz}, batch={batch}, fp16={fp16})...")
+    print("[INFO] This may take several minutes on Jetson Nano.")
+
     # Handle API differences between TensorRT 8.x and 10.x
     if hasattr(builder, "build_engine"):
         engine = builder.build_engine(network, config)          # TRT 8.x
@@ -159,215 +190,106 @@ def convert_onnx_to_engine(onnx_path, engine_path, fp16=True, workspace_mb=4096)
     with open(engine_path, "wb") as f:
         f.write(engine.serialize())
     print(f"[INFO] Engine saved: {engine_path}")
-    return engine_path
+    return str(engine_path)
 
 
-# ═══════════════════════════════════════════════════════════
-# 3. Inference Config & COCO Classes
-# ═══════════════════════════════════════════════════════════
-MODEL_PATH   = "yolov8n.onnx"
-ENGINE_PATH  = "yolov8n_fp16.engine"   # <-- Generated by convert_onnx_to_engine()
-INPUT_SIZE   = 640
-CONF_THRESH  = 0.25
-
-CLASSES = [
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
-    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
-    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep",
-    "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
-    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
-    "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
-    "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
-    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
-    "couch", "potted plant", "bed", "dining table", "toilet", "tv",
-    "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
-    "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
-    "scissors", "teddy bear", "hair drier", "toothbrush"
-]
-
-
-# ═══════════════════════════════════════════════════════════
-# 4. Model Loading (ONNX Runtime + TensorRT EP)
-# ═══════════════════════════════════════════════════════════
-def load_model(onnx_path):
-    """
-    Load ONNX model with ONNX Runtime's TensorRT Execution Provider.
-    On first run, ORT builds/optimizes a TensorRT engine internally
-    and caches it to disk for faster subsequent starts.
-    """
-    trt_ep_options = {
-        "device_id": 0,                         # T4 GPU ID
-        "trt_fp16_enable": True,                # Enable FP16
-        "trt_engine_cache_enable": True,        # Cache built engine
-        "trt_engine_cache_path": "./trt_cache",
-    }
-    providers = [
-        ("TensorrtExecutionProvider", trt_ep_options),
-        "CUDAExecutionProvider",
-        "CPUExecutionProvider",
-    ]
-
-    session = ort.InferenceSession(onnx_path, providers=providers)
-    print(f"[INFO] Active providers: {session.get_providers()}")
-
-    input_name  = session.get_inputs()[0].name
-    output_name = session.get_outputs()[0].name
-    print(f"[INFO] Model loaded — Input: {input_name}, Output: {output_name}")
-    return session, input_name, output_name
-
-
-# ═══════════════════════════════════════════════════════════
-# 5. Pre / Post Processing
-# ═══════════════════════════════════════════════════════════
-def preprocess(frame):
-    img = cv2.resize(frame, (INPUT_SIZE, INPUT_SIZE))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))
-    img = np.expand_dims(img, axis=0)
-    return img
-
-
-def postprocess_with_nms(outputs, orig_h, orig_w):
-    detections = outputs[0]
-    if detections.ndim == 3:
-        detections = detections[0]
-
-    boxes, scores, class_ids = [], [], []
-    scale_x = orig_w / INPUT_SIZE
-    scale_y = orig_h / INPUT_SIZE
-
-    for det in detections:
-        x1, y1, x2, y2, conf, cls_id = det
-        if conf < CONF_THRESH:
-            continue
-
-        x1 = int(x1 * scale_x)
-        y1 = int(y1 * scale_y)
-        x2 = int(x2 * scale_x)
-        y2 = int(y2 * scale_y)
-
-        boxes.append([x1, y1, x2, y2])
-        scores.append(float(conf))
-        class_ids.append(int(cls_id))
-
-    return boxes, scores, class_ids
-
-
-def draw(frame, boxes, scores, class_ids):
-    for box, score, cls_id in zip(boxes, scores, class_ids):
-        x1, y1, x2, y2 = box
-        label = f"{CLASSES[cls_id]}: {score:.2f}"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(frame, label, (x1, y1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    return frame
-
-
-# ═══════════════════════════════════════════════════════════
-# 6. Multi-Camera Streaming
-# ═══════════════════════════════════════════════════════════
-STREAMS = [
-    "http://user7:rangsit1025@118.174.138.142:1025/stw-cgi/video.cgi?msubmenu=stream&action=view&Profile=1",
-    "http://user7:rangsit1033@118.174.138.142:1033/stw-cgi/video.cgi?msubmenu=stream&action=view&Profile=1",
-    "http://user7:rangsit1030@118.174.138.142:1030/stw-cgi/video.cgi?msubmenu=stream&action=view&Profile=1",
-    "http://user7:rangsit1031@118.174.138.142:1031/stw-cgi/video.cgi?msubmenu=stream&action=view&Profile=1",
-    "http://user7:rangsit1035@118.174.138.142:1035/stw-cgi/video.cgi?msubmenu=stream&action=view&Profile=1",
-    "http://user7:rangsit1029@118.174.138.142:1029/stw-cgi/video.cgi?msubmenu=stream&action=view&Profile=1",
-]
-STREAM_LABELS = ["Cam1", "Cam2", "Cam3", "Cam4", "Cam5", "Cam6"]
-GRID_COLS = 3
-GRID_W    = 640
-GRID_H    = 360
-
-
-class CameraStream:
-    """Threaded stream reader so slow cameras don't block each other."""
-    def __init__(self, url, label):
-        self.url   = url
-        self.label = label
-        self.frame = None
-        self.running = True
-        self.cap   = cv2.VideoCapture(url)
-        self.thread = threading.Thread(target=self._read, daemon=True)
-        self.thread.start()
-
-    def _read(self):
-        while self.running:
-            ret, frame = self.cap.read()
-            if ret:
-                self.frame = frame
-            else:
-                self.cap.release()
-                self.cap = cv2.VideoCapture(self.url)
-
-    def get_frame(self):
-        return self.frame
-
-    def stop(self):
-        self.running = False
-        self.cap.release()
-
-
-def run_multi(session, input_name, output_name):
-    streams = [CameraStream(url, label)
-               for url, label in zip(STREAMS, STREAM_LABELS)]
-
-    print("[INFO] Connecting to streams... Press 'q' to quit.")
-
+# ============================================================
+# 3. Interactive prompt helper
+# ============================================================
+def prompt_for_onnx_path() -> str:
+    """Prompt user for an ONNX file path if --onnx was not provided."""
+    print("No --onnx argument provided. Enter the path to your ONNX file.")
     while True:
-        frames = []
-        for stream in streams:
-            frame = stream.get_frame()
-
-            if frame is None:
-                placeholder = np.zeros((GRID_H, GRID_W, 3), dtype=np.uint8)
-                cv2.putText(placeholder, f"{stream.label}: Connecting...",
-                            (10, GRID_H // 2), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7, (100, 100, 100), 2)
-                frames.append(placeholder)
-                continue
-
-            # Detection
-            orig_h, orig_w = frame.shape[:2]
-            inp = preprocess(frame)
-            outputs = session.run([output_name], {input_name: inp})
-            boxes, scores, class_ids = postprocess_with_nms(outputs, orig_h, orig_w)
-            frame = draw(frame, boxes, scores, class_ids)
-
-            cv2.putText(frame, stream.label, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-            frame = cv2.resize(frame, (GRID_W, GRID_H))
-            frames.append(frame)
-
-        # 3×2 grid
-        rows = []
-        for i in range(0, len(frames), GRID_COLS):
-            row_frames = frames[i:i + GRID_COLS]
-            while len(row_frames) < GRID_COLS:
-                row_frames.append(np.zeros((GRID_H, GRID_W, 3), dtype=np.uint8))
-            rows.append(np.hstack(row_frames))
-
-        grid = np.vstack(rows)
-        cv2.imshow("YOLOv8n — CCTV Detection", grid)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    for stream in streams:
-        stream.stop()
-    cv2.destroyAllWindows()
+        raw = input("ONNX path: ").strip()
+        if not raw:
+            print("Path cannot be empty. Try again.")
+            continue
+        p = Path(raw)
+        if not p.exists():
+            print(f"File not found: {p}. Try again.")
+            continue
+        if p.suffix.lower() != ".onnx":
+            print(f"Warning: file does not end with .onnx ({p.suffix}). Proceeding anyway.")
+        return str(p)
 
 
-# ═══════════════════════════════════════════════════════════
-# 7. Main Entry Point
-# ═══════════════════════════════════════════════════════════
+# ============================================================
+# 4. Argument parser
+# ============================================================
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Convert ONNX to TensorRT .engine on Jetson Nano."
+    )
+    parser.add_argument(
+        "--onnx", "-i",
+        default=None,
+        help="Path to input ONNX model. If omitted, you will be prompted interactively.",
+    )
+    parser.add_argument(
+        "--engine", "-o",
+        default=None,
+        help="Path to output .engine file. Defaults to <input>_fp16.engine next to the ONNX file.",
+    )
+    parser.add_argument(
+        "--imgsz", type=int, default=640,
+        help="Model input size (square). Default 640 for YOLO; use 224 for EfficientNet.",
+    )
+    parser.add_argument(
+        "--fp16", action=argparse.BooleanOptionalAction, default=True,
+        help="Enable FP16 precision (default: True). Use --no-fp16 to disable.",
+    )
+    parser.add_argument(
+        "--workspace", type=int, default=1024,
+        help="TensorRT workspace in MB. Default 1024 for Jetson Nano safety.",
+    )
+    parser.add_argument(
+        "--dynamic", action="store_true",
+        help="Allow dynamic batch size (min=1, max=--batch).",
+    )
+    parser.add_argument(
+        "--batch", type=int, default=1,
+        help="Batch size for static shapes, or max batch for dynamic. Default 1.",
+    )
+    return parser.parse_args()
+
+
+# ============================================================
+# 5. Main entry point
+# ============================================================
+def main() -> None:
+    args = parse_args()
+
+    # Resolve ONNX path
+    onnx_path = args.onnx
+    if onnx_path is None:
+        onnx_path = prompt_for_onnx_path()
+    else:
+        onnx_path = str(Path(onnx_path))
+        if not Path(onnx_path).exists():
+            raise FileNotFoundError(f"ONNX file not found: {onnx_path}")
+
+    # Resolve engine path
+    if args.engine:
+        engine_path = str(Path(args.engine))
+    else:
+        p = Path(onnx_path)
+        suffix = "_fp16.engine" if args.fp16 else ".engine"
+        engine_path = str(p.with_suffix("").with_suffix(suffix))
+
+    print(f"[INFO] Input ONNX : {onnx_path}")
+    print(f"[INFO] Output engine: {engine_path}")
+    print(f"[INFO] imgsz={args.imgsz} | fp16={args.fp16} | workspace={args.workspace}MB | batch={args.batch} | dynamic={args.dynamic}")
+
+    convert_onnx_to_engine(
+        onnx_path=onnx_path,
+        engine_path=engine_path,
+        imgsz=args.imgsz,
+        fp16=args.fp16,
+        workspace_mb=args.workspace,
+        dynamic=args.dynamic,
+        batch=args.batch,
+    )
+
+
 if __name__ == "__main__":
-    # Step A: Convert ONNX → TensorRT Engine (Colab T4)
-    #         The generated file is ENGINE_PATH ("yolov8n_fp16.engine")
-    convert_onnx_to_engine(MODEL_PATH, ENGINE_PATH, fp16=True, workspace_mb=4096)
-
-    # Step B: Load model with ONNX Runtime + TensorRT EP and run inference
-    session, input_name, output_name = load_model(MODEL_PATH)
-    run_multi(session, input_name, output_name)
+    main()
