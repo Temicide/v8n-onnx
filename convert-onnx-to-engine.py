@@ -21,8 +21,6 @@ Examples:
         --imgsz 224
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 import subprocess
@@ -53,7 +51,7 @@ def find_trtexec():
     # 3) Check system PATH
     for cmd in (["which", "trtexec"], ["where", "trtexec"]):
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5)
             if r.returncode == 0 and r.stdout.strip():
                 return r.stdout.strip().splitlines()[0]
         except Exception:
@@ -107,7 +105,7 @@ def convert_onnx_to_engine(
             cmd.append("--fp16")
 
         print(f"[INFO] Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=False, text=True)
+        result = subprocess.run(cmd, stdout=None, stderr=None, universal_newlines=True)
         if result.returncode == 0 and engine_path.exists():
             print(f"[INFO] trtexec conversion successful: {engine_path}")
             return str(engine_path)
@@ -281,7 +279,7 @@ def main() -> None:
     else:
         p = Path(onnx_path)
         suffix = "_fp16.engine" if fp16 else ".engine"
-        engine_path = str(p.with_suffix("").with_suffix(suffix))
+        engine_path = str(p.parent / (p.stem + suffix))
 
     print(f"[INFO] Input ONNX : {onnx_path}")
     print(f"[INFO] Output engine: {engine_path}")
