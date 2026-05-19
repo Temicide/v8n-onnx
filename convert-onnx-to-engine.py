@@ -234,9 +234,14 @@ def parse_args() -> argparse.Namespace:
         "--imgsz", type=int, default=640,
         help="Model input size (square). Default 640 for YOLO; use 224 for EfficientNet.",
     )
-    parser.add_argument(
-        "--fp16", action=argparse.BooleanOptionalAction, default=True,
-        help="Enable FP16 precision (default: True). Use --no-fp16 to disable.",
+    fp16_group = parser.add_mutually_exclusive_group()
+    fp16_group.add_argument(
+        "--fp16", action="store_true", default=True,
+        help="Enable FP16 precision (default).",
+    )
+    fp16_group.add_argument(
+        "--no-fp16", action="store_true", default=False,
+        help="Disable FP16 precision.",
     )
     parser.add_argument(
         "--workspace", type=int, default=1024,
@@ -268,23 +273,25 @@ def main() -> None:
         if not Path(onnx_path).exists():
             raise FileNotFoundError(f"ONNX file not found: {onnx_path}")
 
+    fp16 = not args.no_fp16
+
     # Resolve engine path
     if args.engine:
         engine_path = str(Path(args.engine))
     else:
         p = Path(onnx_path)
-        suffix = "_fp16.engine" if args.fp16 else ".engine"
+        suffix = "_fp16.engine" if fp16 else ".engine"
         engine_path = str(p.with_suffix("").with_suffix(suffix))
 
     print(f"[INFO] Input ONNX : {onnx_path}")
     print(f"[INFO] Output engine: {engine_path}")
-    print(f"[INFO] imgsz={args.imgsz} | fp16={args.fp16} | workspace={args.workspace}MB | batch={args.batch} | dynamic={args.dynamic}")
+    print(f"[INFO] imgsz={args.imgsz} | fp16={fp16} | workspace={args.workspace}MB | batch={args.batch} | dynamic={args.dynamic}")
 
     convert_onnx_to_engine(
         onnx_path=onnx_path,
         engine_path=engine_path,
         imgsz=args.imgsz,
-        fp16=args.fp16,
+        fp16=fp16,
         workspace_mb=args.workspace,
         dynamic=args.dynamic,
         batch=args.batch,
